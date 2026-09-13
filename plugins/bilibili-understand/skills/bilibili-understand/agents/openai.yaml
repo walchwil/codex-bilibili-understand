@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bilibili Understand"
+  short_description: "Turn Bilibili videos into timestamped evidence"
+  default_prompt: "Use $bilibili-understand to analyze this Bilibili video with second-level timestamps and cite the relevant moments."

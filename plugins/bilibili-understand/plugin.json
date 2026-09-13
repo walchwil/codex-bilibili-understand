@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "bilibili-understand",
+  "version": "0.1.0",
+  "description": "Turn one Bilibili video into evidence-backed, second-level timestamps.",
+  "author": {
+    "name": "Dakai",
+    "url": "https://github.com/walchwil"
+  },
+  "homepage": "https://github.com/walchwil/codex-bilibili-understand#readme",
+  "repository": "https://github.com/walchwil/codex-bilibili-understand",
+  "license": "MIT",
+  "keywords": ["bilibili", "video", "asr", "timestamps", "codex"]
+}

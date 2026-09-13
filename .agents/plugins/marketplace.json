@@ -1,0 +1,20 @@
+{
+  "name": "bilibili-tools",
+  "interface": {
+    "displayName": "Bilibili Tools"
+  },
+  "plugins": [
+    {
+      "name": "bilibili-understand",
+      "source": {
+        "source": "local",
+        "path": "./plugins/bilibili-understand"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
