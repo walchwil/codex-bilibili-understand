@@ -7,6 +7,7 @@ import ctypes
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,12 @@ def atomic_write(path: Path, content: str) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(content, encoding="utf-8")
     temporary.replace(path)
+
+
+def audio_signature(path: Path) -> dict[str, int]:
+    """Return a cheap identity for the immutable audio cache artifact."""
+    stat = path.stat()
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
 def prepare_runtime(device: str) -> None:
@@ -73,50 +80,55 @@ def run_whisper(
     compute_type: str,
     vad_filter: bool,
     hotwords: str | None,
+    word_timestamps: bool,
+    beam_size: int,
     clip_start: float | None = None,
     clip_end: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     prepare_runtime(device)
     from faster_whisper import WhisperModel
 
+    model_started = time.perf_counter()
     model = WhisperModel(
         model_name,
         device=device,
         compute_type=compute_type,
         download_root=str(model_cache),
     )
+    model_load_s = time.perf_counter() - model_started
     clip_timestamps = (
         f"{clip_start},{clip_end}" if clip_start is not None and clip_end is not None else "0"
     )
+    decode_started = time.perf_counter()
     segments, info = model.transcribe(
         str(audio_path),
         language=language,
         vad_filter=vad_filter,
-        word_timestamps=True,
+        word_timestamps=word_timestamps,
+        beam_size=beam_size,
         hotwords=hotwords,
         clip_timestamps=clip_timestamps,
     )
 
     records = []
     for segment in segments:
-        words = [
-            {
-                "start_s": round(word.start, 3),
-                "end_s": round(word.end, 3),
-                "text": word.word,
-                "probability": round(word.probability, 4),
-            }
-            for word in (segment.words or [])
-        ]
-        records.append(
-            {
-                "start_s": round(segment.start, 3),
-                "end_s": round(segment.end, 3),
-                "text": segment.text.strip(),
-                "words": words,
-                "source": f"asr:faster-whisper/{model_name}",
-            }
-        )
+        record = {
+            "start_s": round(segment.start, 3),
+            "end_s": round(segment.end, 3),
+            "text": segment.text.strip(),
+            "source": f"asr:faster-whisper/{model_name}",
+        }
+        if word_timestamps:
+            record["words"] = [
+                {
+                    "start_s": round(word.start, 3),
+                    "end_s": round(word.end, 3),
+                    "text": word.word,
+                    "probability": round(word.probability, 4),
+                }
+                for word in (segment.words or [])
+            ]
+        records.append(record)
 
     details = {
         "model": model_name,
@@ -125,6 +137,9 @@ def run_whisper(
         "compute_type": compute_type,
         "vad_filter": vad_filter,
         "hotwords": hotwords,
+        "word_timestamps": word_timestamps,
+        "beam_size": beam_size,
+        "audio_signature": audio_signature(audio_path),
         "clip_start_s": clip_start,
         "clip_end_s": clip_end,
         "language": getattr(info, "language", language),
@@ -132,6 +147,8 @@ def run_whisper(
         "duration_s": getattr(info, "duration", None),
         "duration_after_vad_s": getattr(info, "duration_after_vad", None),
         "segment_count": len(records),
+        "model_load_s": round(model_load_s, 3),
+        "decode_s": round(time.perf_counter() - decode_started, 3),
     }
     return records, details
 
@@ -162,6 +179,9 @@ def transcribe(args: argparse.Namespace) -> int:
             )
         )
         return 2
+    if args.beam_size < 1:
+        print(json.dumps({"status": "invalid_argument", "message": "--beam-size must be >= 1"}))
+        return 2
 
     try:
         records, details = run_whisper(
@@ -173,6 +193,8 @@ def transcribe(args: argparse.Namespace) -> int:
             args.compute_type,
             args.vad_filter,
             args.hotwords,
+            args.word_timestamps,
+            args.beam_size,
             args.clip_start,
             args.clip_end,
         )
@@ -206,6 +228,8 @@ def transcribe(args: argparse.Namespace) -> int:
             "int8",
             args.vad_filter,
             args.hotwords,
+            args.word_timestamps,
+            args.beam_size,
             args.clip_start,
             args.clip_end,
         )
@@ -260,6 +284,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--hotwords",
         help="space-separated terms known from the title or user-provided context",
+    )
+    parser.add_argument(
+        "--word-timestamps",
+        action="store_true",
+        help="retain word-level timestamps; off by default for faster, smaller transcripts",
+    )
+    parser.add_argument(
+        "--beam-size",
+        type=int,
+        default=5,
+        help="Whisper beam size; lower values trade accuracy for speed",
     )
     parser.add_argument("--clip-start", type=float)
     parser.add_argument("--clip-end", type=float)

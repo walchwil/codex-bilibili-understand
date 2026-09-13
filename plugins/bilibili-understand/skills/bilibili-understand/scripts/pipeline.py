@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
+import html
 from io import StringIO
 import json
+import os
 import re
 import subprocess
 import sys
@@ -22,7 +24,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROBE_SCRIPT = SCRIPT_DIR / "probe_bilibili.py"
 TRANSCRIBE_SCRIPT = SCRIPT_DIR / "transcribe_audio.py"
 RETRYABLE_STATUSES = {"network_error"}
+RETRYABLE_ASR_STATUSES = {"asr_timeout", "process_error"}
 TEMP_AUDIO_SUFFIXES = {".part", ".tmp", ".ytdl"}
+
+
+class PipelineBusy(RuntimeError):
+    """Another process currently owns this video's download/ASR lock."""
 
 
 def now_iso() -> str:
@@ -105,6 +112,72 @@ def load_segments(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def parse_subtitle_time(value: str) -> float:
+    raw = value.strip().replace(",", ".")
+    parts = raw.split(":")
+    if len(parts) == 2:
+        hours = 0
+        minutes, seconds = parts
+    elif len(parts) == 3:
+        hours, minutes, seconds = parts
+    else:
+        raise ValueError(f"invalid subtitle timestamp {value!r}")
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def clean_subtitle_text(lines: Iterable[str]) -> str:
+    text = " ".join(line.strip() for line in lines if line.strip())
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\{[^}]+\}", "", text)
+    return html.unescape(text).strip()
+
+
+def load_subtitle_segments(path: Path) -> list[dict[str, Any]]:
+    """Normalize VTT/SRT cues into the same compact segment contract as ASR."""
+    lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    records: list[dict[str, Any]] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        if "-->" not in line:
+            index += 1
+            continue
+        left, right = (part.strip() for part in line.split("-->", 1))
+        right = right.split(maxsplit=1)[0]
+        try:
+            start_s = parse_subtitle_time(left.split(maxsplit=1)[0])
+            end_s = parse_subtitle_time(right)
+        except (ValueError, IndexError):
+            index += 1
+            continue
+        index += 1
+        text_lines = []
+        while index < len(lines) and lines[index].strip():
+            text_lines.append(lines[index])
+            index += 1
+        text = clean_subtitle_text(text_lines)
+        if text and end_s > start_s:
+            records.append(
+                {
+                    "start_s": round(start_s, 3),
+                    "end_s": round(end_s, 3),
+                    "text": text,
+                    "source": f"subtitle:{path.suffix.lstrip('.')}",
+                }
+            )
+        index += 1
+    return records
+
+
+def subtitle_segments_path(video_dir: Path) -> Path:
+    return video_dir / "subtitle_segments.jsonl"
+
+
+def subtitle_cache_available(video_dir: Path) -> bool:
+    path = subtitle_segments_path(video_dir)
+    return path.is_file() and path.stat().st_size > 0
+
+
 def select_segments(
     records: Iterable[dict[str, Any]], start_s: float, end_s: float
 ) -> list[dict[str, Any]]:
@@ -158,6 +231,8 @@ def resolve_asr_config(
     args: argparse.Namespace, existing: dict[str, Any] | None
 ) -> dict[str, Any]:
     existing = existing or {}
+    requested_word_timestamps = getattr(args, "word_timestamps", None)
+    requested_beam_size = getattr(args, "beam_size", None)
     existing_language = existing.get(
         "requested_language", existing.get("language", "zh")
     )
@@ -174,7 +249,65 @@ def resolve_asr_config(
             if args.hotwords is not None
             else normalized_hotwords(existing.get("hotwords"))
         ),
+        "word_timestamps": (
+            bool(requested_word_timestamps)
+            if requested_word_timestamps is not None
+            else bool(existing.get("word_timestamps", False))
+        ),
+        "beam_size": (
+            int(requested_beam_size)
+            if requested_beam_size is not None
+            else int(existing.get("beam_size", 5))
+        ),
     }
+
+
+def audio_signature(path: Path | None) -> dict[str, int] | None:
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+@contextmanager
+def video_lock(
+    video_dir: Path, timeout_s: float = 60.0, stale_after_s: float | None = None
+):
+    """Serialize mutating work for one video with a recoverable lock file."""
+    video_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = video_dir / ".pipeline.lock"
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    stale_after_s = stale_after_s or max(600.0, timeout_s * 10)
+    while True:
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"pid": os.getpid(), "created_at": now_iso()}))
+            break
+        except FileExistsError:
+            try:
+                stale = time.time() - lock_path.stat().st_mtime > stale_after_s
+            except OSError:
+                stale = False
+            if stale:
+                try:
+                    lock_path.unlink()
+                    continue
+                except OSError:
+                    pass
+            if time.monotonic() >= deadline:
+                raise PipelineBusy(f"video pipeline is busy: {video_dir}")
+            time.sleep(0.2)
+    try:
+        yield
+    finally:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def asr_cache_matches(
@@ -189,12 +322,23 @@ def asr_cache_matches(
         return False
 
     actual_language = metadata.get("requested_language", metadata.get("language"))
-    return (
+    config_matches = (
         metadata.get("model") == requested["model"]
         and actual_language == requested["language"]
         and bool(metadata.get("vad_filter")) == requested["vad_filter"]
         and normalized_hotwords(metadata.get("hotwords")) == requested["hotwords"]
     )
+    if not config_matches:
+        return False
+    # New caches bind ASR output to the exact local audio artifact. Older v0.2
+    # metadata has no signature and remains readable for backward compatibility.
+    defaults = {"word_timestamps": False, "beam_size": 5}
+    for field, default in defaults.items():
+        if metadata.get(field, default) != requested.get(field, default):
+            return False
+    current_signature = audio_signature(find_audio(transcript_path.parent))
+    saved_signature = metadata.get("audio_signature")
+    return saved_signature is None or saved_signature == current_signature
 
 
 def clip_index_path(video_dir: Path) -> Path:
@@ -205,6 +349,13 @@ def load_clip_index(video_dir: Path) -> list[dict[str, Any]]:
     index = read_json(clip_index_path(video_dir)) or {}
     clips = index.get("clips", [])
     return [clip for clip in clips if isinstance(clip, dict)]
+
+
+def asr_configs_match(actual: Any, requested: dict[str, Any]) -> bool:
+    if not isinstance(actual, dict):
+        return False
+    defaults = {"word_timestamps": False, "beam_size": 5}
+    return all(actual.get(key, defaults.get(key)) == value for key, value in requested.items())
 
 
 def clip_segments_path(video_dir: Path, entry: dict[str, Any]) -> Path | None:
@@ -224,10 +375,17 @@ def covered_clip_entries(
     start_s: float,
     end_s: float,
     requested: dict[str, Any] | None = None,
+    requested_audio_signature: dict[str, int] | None = None,
 ) -> list[dict[str, Any]] | None:
     candidates = []
     for entry in load_clip_index(video_dir):
-        if requested is not None and entry.get("config") != requested:
+        if requested is not None and not asr_configs_match(entry.get("config"), requested):
+            continue
+        if (
+            requested_audio_signature is not None
+            and entry.get("audio_signature") is not None
+            and entry.get("audio_signature") != requested_audio_signature
+        ):
             continue
         path = clip_segments_path(video_dir, entry)
         if (
@@ -453,6 +611,90 @@ def download_audio(
     return payload, None, args.network_attempts
 
 
+def download_subtitles(
+    args: argparse.Namespace, url: str, video_dir: Path
+) -> tuple[dict[str, Any], Path | None, int]:
+    """Fetch native captions without exposing signed subtitle URLs in metadata."""
+    yt_dlp = probe_bilibili.find_yt_dlp()
+    if not yt_dlp:
+        return {"status": "tool_missing", "message": "yt-dlp is unavailable"}, None, 0
+
+    existing = sorted(video_dir.glob("subtitle.*.vtt")) + sorted(video_dir.glob("subtitle.vtt"))
+    if existing:
+        return {"status": "cached"}, existing[0], 0
+
+    base_command = [
+        *yt_dlp,
+        "--skip-download",
+        "--no-playlist",
+        "--no-warnings",
+        "--sub-langs",
+        "zh.*,zh,chi_sim,chi_tra,en.*",
+        "--sub-format",
+        "vtt",
+        "--retries",
+        "1",
+        "--socket-timeout",
+        str(args.socket_timeout),
+        "--output",
+        str(video_dir / "subtitle.%(language)s.%(ext)s"),
+    ]
+    if args.cookies_from_browser:
+        base_command.extend(["--cookies-from-browser", args.cookies_from_browser])
+
+    for automatic in (False, True):
+        command = [*base_command, "--write-auto-subs" if automatic else "--write-subs", "--", url]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=args.download_timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "status": "network_error",
+                "message": f"subtitle download exceeded {args.download_timeout}s",
+            }, None, 1
+        subtitle_files = sorted(video_dir.glob("subtitle.*.vtt")) + sorted(
+            video_dir.glob("subtitle.vtt")
+        )
+        if completed.returncode == 0 and subtitle_files:
+            return {"status": "ok", "automatic": automatic}, subtitle_files[0], 1
+        if completed.returncode != 0 and not automatic:
+            detail = (completed.stderr or completed.stdout).strip()[-2000:]
+            if probe_bilibili.classify_failure(detail) in {"anti_bot", "auth_required"}:
+                return {"status": probe_bilibili.classify_failure(detail), "message": detail}, None, 1
+    return {"status": "no_subtitles"}, None, 1
+
+
+def save_subtitle_cache(video_dir: Path, source_path: Path) -> int:
+    records = load_subtitle_segments(source_path)
+    if not records:
+        raise ValueError("subtitle file contained no usable cues")
+    destination = subtitle_segments_path(video_dir)
+    atomic_write(
+        destination,
+        "".join(
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            for record in records
+        ),
+    )
+    atomic_write_json(
+        video_dir / "subtitle_metadata.json",
+        {
+            "schema_version": 1,
+            "source_path": source_path.name,
+            "segment_count": len(records),
+            "fetched_at": now_iso(),
+        },
+    )
+    return len(records)
+
+
 def run_asr(
     args: argparse.Namespace,
     audio_path: Path,
@@ -477,16 +719,46 @@ def run_asr(
         args.device,
         "--compute-type",
         args.compute_type,
+        "--beam-size",
+        str(args.beam_size),
     ]
     if args.vad_filter:
         command.append("--vad-filter")
     if args.hotwords:
         command.extend(["--hotwords", args.hotwords])
+    if args.word_timestamps:
+        command.append("--word-timestamps")
     if clip_start is not None and clip_end is not None:
         command.extend(["--clip-start", str(clip_start), "--clip-end", str(clip_end)])
     if not args.cpu_fallback:
         command.append("--no-cpu-fallback")
     return run_json_command(command, args.asr_timeout, timeout_status="asr_timeout")
+
+
+def run_asr_with_retry(
+    args: argparse.Namespace,
+    audio_path: Path,
+    output_dir: Path,
+    clip_start: float | None = None,
+    clip_end: float | None = None,
+) -> tuple[int, dict[str, Any], int]:
+    attempts = max(1, int(args.asr_attempts))
+    result: dict[str, Any] = {"status": "process_error"}
+    code = 4
+    for attempt in range(1, attempts + 1):
+        code, result = run_asr(
+            args,
+            audio_path,
+            output_dir,
+            clip_start=clip_start,
+            clip_end=clip_end,
+        )
+        if code == 0 and result.get("status") == "ok":
+            return code, result, attempt
+        if result.get("status") not in RETRYABLE_ASR_STATUSES or attempt == attempts:
+            return code, result, attempt
+        time.sleep(min(2.0, 0.25 * attempt))
+    return code, result, attempts
 
 
 def mark_stage(
@@ -542,8 +814,13 @@ def prepare(args: argparse.Namespace) -> int:
     except probe_bilibili.InputError as exc:
         emit({"status": "invalid_url", "message": str(exc)})
         return 2
-    if args.network_attempts < 1:
-        emit({"status": "invalid_argument", "message": "--network-attempts must be >= 1"})
+    if args.network_attempts < 1 or args.asr_attempts < 1:
+        emit(
+            {
+                "status": "invalid_argument",
+                "message": "--network-attempts and --asr-attempts must be >= 1",
+            }
+        )
         return 2
 
     key = probe_bilibili.video_key(url)
@@ -601,8 +878,42 @@ def prepare(args: argparse.Namespace) -> int:
     args.language = requested_asr["language"]
     args.vad_filter = requested_asr["vad_filter"]
     args.hotwords = requested_asr["hotwords"]
+    if requested_asr["beam_size"] < 1:
+        return finish_prepare(
+            state_path,
+            state,
+            "invalid_argument",
+            total_started,
+            2,
+            message="--beam-size must be >= 1",
+        )
     state["requested_asr"] = requested_asr
     save_state(state_path, state)
+    if subtitle_cache_available(video_dir) and not args.force_asr:
+        stage_started = time.perf_counter()
+        try:
+            segment_count = len(load_segments(subtitle_segments_path(video_dir)))
+        except (OSError, ValueError):
+            segment_count = 0
+        if segment_count:
+            mark_stage(
+                state,
+                "subtitles",
+                "cached",
+                stage_started,
+                path=str(subtitle_segments_path(video_dir).resolve()),
+            )
+            return finish_prepare(
+                state_path,
+                state,
+                "ready",
+                total_started,
+                0,
+                cached=True,
+                source="subtitle_cache",
+                segments_path=str(subtitle_segments_path(video_dir).resolve()),
+                segment_count=segment_count,
+            )
     if not args.refresh_asr and asr_cache_matches(
         transcript_path, asr_metadata_path, requested_asr
     ):
@@ -667,15 +978,66 @@ def prepare(args: argparse.Namespace) -> int:
                 if isinstance(track, dict) and track.get("language")
             )
     if subtitle_languages and not args.force_asr:
-        return finish_prepare(
-            state_path,
-            state,
-            "subtitles_available",
-            total_started,
-            0,
-            subtitle_languages=subtitle_languages,
-            message="v0.2 detects subtitle tracks but does not normalize them; use --force-asr if local ASR is desired.",
-        )
+        if getattr(args, "prefer_subtitles", False):
+            stage_started = time.perf_counter()
+            print("[subtitles] downloading captions", file=sys.stderr, flush=True)
+            subtitle_result, subtitle_path, attempts = download_subtitles(args, url, video_dir)
+            if subtitle_path is not None:
+                try:
+                    segment_count = save_subtitle_cache(video_dir, subtitle_path)
+                except (OSError, ValueError) as exc:
+                    subtitle_result = {"status": "subtitle_error", "message": str(exc)}
+                else:
+                    mark_stage(
+                        state,
+                        "subtitles",
+                        "ok",
+                        stage_started,
+                        attempts=attempts,
+                        path=str(subtitle_segments_path(video_dir).resolve()),
+                        segment_count=segment_count,
+                    )
+                    return finish_prepare(
+                        state_path,
+                        state,
+                        "ready",
+                        total_started,
+                        0,
+                        cached=False,
+                        source="subtitle_cache",
+                        segments_path=str(subtitle_segments_path(video_dir).resolve()),
+                        segment_count=segment_count,
+                    )
+            mark_stage(
+                state,
+                "subtitles",
+                str(subtitle_result.get("status", "subtitle_error")),
+                stage_started,
+                attempts=attempts,
+                message=subtitle_result.get("message"),
+            )
+            if getattr(args, "allow_asr_fallback", False):
+                args.force_asr = True
+            else:
+                return finish_prepare(
+                    state_path,
+                    state,
+                    "subtitles_available",
+                    total_started,
+                    0,
+                    subtitle_languages=subtitle_languages,
+                    message="subtitle download failed; use --force-asr to run local ASR",
+                )
+        else:
+            return finish_prepare(
+                state_path,
+                state,
+                "subtitles_available",
+                total_started,
+                0,
+                subtitle_languages=subtitle_languages,
+                message="subtitle tracks detected; use --prefer-subtitles to normalize them",
+            )
 
     stage_started = time.perf_counter()
     audio_path = find_audio(video_dir)
@@ -726,7 +1088,7 @@ def prepare(args: argparse.Namespace) -> int:
 
     stage_started = time.perf_counter()
     print("[asr] transcribing", file=sys.stderr, flush=True)
-    asr_code, asr_result = run_asr(args, audio_path, video_dir)
+    asr_code, asr_result, asr_attempts = run_asr_with_retry(args, audio_path, video_dir)
     asr_status = str(asr_result.get("status"))
     if asr_code != 0 or asr_status != "ok":
         mark_stage(
@@ -734,7 +1096,7 @@ def prepare(args: argparse.Namespace) -> int:
             "asr",
             asr_status,
             stage_started,
-            attempts=1,
+            attempts=asr_attempts,
             message=asr_result.get("message"),
         )
         return finish_prepare(
@@ -750,7 +1112,7 @@ def prepare(args: argparse.Namespace) -> int:
         "asr",
         "ok",
         stage_started,
-        attempts=1,
+        attempts=asr_attempts,
         transcript_path=str(transcript_path.resolve()),
     )
     save_state(state_path, state)
@@ -795,6 +1157,7 @@ def emit_query_result(
     end_s: float,
     records: list[dict[str, Any]],
     source: str,
+    timings: dict[str, float] | None = None,
 ) -> int:
     selected = select_segments(records, start_s, end_s)
     if not selected:
@@ -817,18 +1180,19 @@ def emit_query_result(
             for record in selected
         ),
     )
-    emit(
-        {
-            "status": "ok",
-            "video_key": key,
-            "start_s": start_s,
-            "end_s": end_s,
-            "segment_count": len(selected),
-            "excerpt_path": str(excerpt_path.resolve()),
-            "source": source,
-            "segments": selected,
-        }
-    )
+    response = {
+        "status": "ok",
+        "video_key": key,
+        "start_s": start_s,
+        "end_s": end_s,
+        "segment_count": len(selected),
+        "excerpt_path": str(excerpt_path.resolve()),
+        "source": source,
+        "segments": selected,
+    }
+    if timings:
+        response["timings_s"] = timings
+    emit(response)
     return 0
 
 
@@ -847,6 +1211,8 @@ def query(args: argparse.Namespace) -> int:
         source, source_name = compact_path, "full_cache"
     elif transcript_path.is_file():
         source, source_name = transcript_path, "full_cache"
+    elif subtitle_cache_available(video_dir):
+        source, source_name = subtitle_segments_path(video_dir), "subtitle_cache"
     else:
         entries = covered_clip_entries(video_dir, start_s, end_s)
         if entries is None:
@@ -892,7 +1258,7 @@ def capture_prepare(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         return code, {"status": "prepare_error", "message": lines[-1][-2000:]}
 
 
-def run(args: argparse.Namespace) -> int:
+def _run_unlocked(args: argparse.Namespace) -> int:
     if args.full and any(value is not None for value in (args.start, args.end, args.duration)):
         emit({"status": "invalid_argument", "message": "--full cannot be combined with a time range"})
         return 2
@@ -922,6 +1288,16 @@ def run(args: argparse.Namespace) -> int:
         requested_config = resolve_asr_config(
             args, read_json(video_dir / "asr_metadata.json")
         )
+        if not args.force_asr and subtitle_cache_available(video_dir):
+            return query(
+                argparse.Namespace(
+                    target=args.url,
+                    output_root=args.output_root,
+                    start=args.start,
+                    end=args.end,
+                    duration=args.duration,
+                )
+            )
         if full_cache_matches(video_dir, args):
             return query(
                 argparse.Namespace(
@@ -934,7 +1310,11 @@ def run(args: argparse.Namespace) -> int:
             )
         if not args.refresh_asr:
             cached_entries = covered_clip_entries(
-                video_dir, start_s, end_s, requested_config
+                video_dir,
+                start_s,
+                end_s,
+                requested_config,
+                audio_signature(find_audio(video_dir)),
             )
             if cached_entries is not None:
                 return emit_query_result(
@@ -956,7 +1336,11 @@ def run(args: argparse.Namespace) -> int:
         compute_type=args.compute_type,
         vad_filter=args.vad_filter,
         hotwords=args.hotwords,
-        force_asr=args.force_asr or not args.full,
+        word_timestamps=args.word_timestamps,
+        beam_size=args.beam_size,
+        force_asr=args.force_asr,
+        prefer_subtitles=not args.force_asr,
+        allow_asr_fallback=True,
         refresh_metadata=args.refresh_metadata,
         refresh_asr=args.refresh_asr,
         cookies_from_browser=args.cookies_from_browser,
@@ -965,6 +1349,7 @@ def run(args: argparse.Namespace) -> int:
         probe_timeout=args.probe_timeout,
         download_timeout=args.download_timeout,
         asr_timeout=args.asr_timeout,
+        asr_attempts=args.asr_attempts,
         cpu_fallback=args.cpu_fallback,
         audio_only=not args.full,
     )
@@ -989,7 +1374,20 @@ def run(args: argparse.Namespace) -> int:
         "language": prepare_args.language,
         "vad_filter": bool(prepare_args.vad_filter),
         "hotwords": normalized_hotwords(prepare_args.hotwords),
+        "word_timestamps": bool(prepare_args.word_timestamps),
+        "beam_size": int(prepare_args.beam_size),
     }
+
+    if not args.force_asr and subtitle_cache_available(video_dir):
+        return query(
+            argparse.Namespace(
+                target=args.url,
+                output_root=args.output_root,
+                start=args.start,
+                end=args.end,
+                duration=args.duration,
+            )
+        )
 
     if full_cache_matches(video_dir, prepare_args):
         return query(
@@ -1003,7 +1401,13 @@ def run(args: argparse.Namespace) -> int:
         )
 
     if not args.refresh_asr:
-        cached_entries = covered_clip_entries(video_dir, start_s, end_s, requested_config)
+        cached_entries = covered_clip_entries(
+            video_dir,
+            start_s,
+            end_s,
+            requested_config,
+            audio_signature(find_audio(video_dir)),
+        )
     else:
         cached_entries = None
     if cached_entries is not None:
@@ -1036,8 +1440,13 @@ def run(args: argparse.Namespace) -> int:
     clip_name = f"{round(clip_start * 1000)}-{round(clip_end * 1000)}"
     clip_dir = video_dir / "clips" / clip_name
     print(f"[clip] transcribing {clip_start:.3f}s-{clip_end:.3f}s", file=sys.stderr, flush=True)
-    asr_code, asr_result = run_asr(
-        prepare_args, audio_path, clip_dir, clip_start=clip_start, clip_end=clip_end
+    asr_started = time.perf_counter()
+    asr_code, asr_result, asr_attempts = run_asr_with_retry(
+        prepare_args,
+        audio_path,
+        clip_dir,
+        clip_start=clip_start,
+        clip_end=clip_end,
     )
     if asr_code != 0 or asr_result.get("status") != "ok":
         emit(
@@ -1047,12 +1456,14 @@ def run(args: argparse.Namespace) -> int:
                 "detail": asr_result,
                 "clip_start_s": clip_start,
                 "clip_end_s": clip_end,
+                "attempts": asr_attempts,
             }
         )
         return 5
 
     transcript_path = clip_dir / "transcript.jsonl"
     segments_path = clip_dir / "segments.jsonl"
+    compact_started = time.perf_counter()
     try:
         compact_transcript(transcript_path, segments_path)
         save_clip_entry(
@@ -1062,13 +1473,66 @@ def run(args: argparse.Namespace) -> int:
                 "coverage_end_s": clip_end,
                 "segments_path": str(segments_path.relative_to(video_dir)),
                 "config": requested_config,
+                "audio_signature": audio_signature(audio_path),
             },
         )
         records = load_segments(segments_path)
     except (OSError, ValueError) as exc:
         emit({"status": "run_failed", "phase": "compact", "message": str(exc)})
         return 5
-    return emit_query_result(video_dir, key, start_s, end_s, records, "clip_new")
+    timings = {
+        "asr": round(time.perf_counter() - asr_started, 3),
+        "compact": round(time.perf_counter() - compact_started, 3),
+    }
+    timings["total"] = round(sum(timings.values()), 3)
+    state_path = video_dir / "pipeline_state.json"
+    state = read_json(state_path) or {"schema_version": 1, "stages": {}}
+    state["status"] = "ready"
+    state["last_run"] = {
+        "mode": "range",
+        "status": "ready",
+        "start_s": start_s,
+        "end_s": end_s,
+        "clip_start_s": clip_start,
+        "clip_end_s": clip_end,
+        "source": "clip_new",
+        "attempts": asr_attempts,
+        "timings_s": timings,
+    }
+    save_state(state_path, state)
+    return emit_query_result(
+        video_dir, key, start_s, end_s, records, "clip_new", timings=timings
+    )
+
+
+def run(args: argparse.Namespace) -> int:
+    try:
+        key = target_key(args.url)
+    except probe_bilibili.InputError as exc:
+        emit({"status": "invalid_argument", "message": str(exc)})
+        return 2
+    try:
+        with video_lock(
+            args.output_root / key,
+            float(getattr(args, "lock_timeout", 60.0)),
+            stale_after_s=max(
+                float(getattr(args, "asr_timeout", 14400)),
+                float(getattr(args, "download_timeout", 3600)),
+                3600.0,
+            )
+            * 2,
+        ):
+            return _run_unlocked(args)
+    except PipelineBusy as exc:
+        emit(
+            {
+                "status": "pipeline_busy",
+                "video_key": key,
+                "message": str(exc),
+                "retryable": True,
+            }
+        )
+        return 6
 
 
 def status(args: argparse.Namespace) -> int:
@@ -1082,6 +1546,7 @@ def status(args: argparse.Namespace) -> int:
     metadata = video_dir / "metadata.json"
     transcript = video_dir / "transcript.jsonl"
     segments = video_dir / "segments.jsonl"
+    subtitle_segments = subtitle_segments_path(video_dir)
     asr_metadata = video_dir / "asr_metadata.json"
     audio = find_audio(video_dir)
     state = read_json(video_dir / "pipeline_state.json")
@@ -1090,9 +1555,10 @@ def status(args: argparse.Namespace) -> int:
         "audio": audio is not None,
         "transcript": transcript.is_file() and transcript.stat().st_size > 0,
         "segments": segments.is_file() and segments.stat().st_size > 0,
+        "subtitle_segments": subtitle_segments.is_file() and subtitle_segments.stat().st_size > 0,
         "asr_metadata": asr_metadata.is_file() and asr_metadata.stat().st_size > 0,
     }
-    if artifacts["segments"] or artifacts["transcript"]:
+    if artifacts["segments"] or artifacts["transcript"] or artifacts["subtitle_segments"]:
         cache_status = "ready"
     elif artifacts["metadata"] or artifacts["audio"]:
         cache_status = "partial"
@@ -1123,6 +1589,23 @@ def add_prepare_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--compute-type", default="float16")
     parser.add_argument("--vad-filter", action="store_true", default=None)
     parser.add_argument("--hotwords")
+    parser.add_argument(
+        "--prefer-subtitles",
+        action="store_true",
+        help="download and normalize available captions before local ASR",
+    )
+    parser.add_argument(
+        "--word-timestamps",
+        action="store_true",
+        default=None,
+        help="retain word-level timestamps; off by default for faster, smaller transcripts",
+    )
+    parser.add_argument(
+        "--beam-size",
+        type=int,
+        default=None,
+        help="Whisper beam size; lower values trade accuracy for speed",
+    )
     parser.add_argument("--force-asr", action="store_true")
     parser.add_argument("--refresh-metadata", action="store_true")
     parser.add_argument("--refresh-asr", action="store_true")
@@ -1135,13 +1618,19 @@ def add_prepare_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--download-timeout", type=int, default=3600)
     parser.add_argument("--asr-timeout", type=int, default=14400)
     parser.add_argument(
+        "--asr-attempts",
+        type=int,
+        default=1,
+        help="bounded retries for transient local ASR process failures",
+    )
+    parser.add_argument(
         "--no-cpu-fallback", action="store_false", dest="cpu_fallback", default=True
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", action="version", version="%(prog)s 0.3.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.4.0")
     commands = parser.add_subparsers(dest="command", required=True)
 
     prepare_parser = commands.add_parser(
@@ -1164,6 +1653,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_interval.add_argument("--duration")
     run_parser.add_argument("--context-before", type=float, default=3.0)
     run_parser.add_argument("--context-after", type=float, default=3.0)
+    run_parser.add_argument(
+        "--lock-timeout",
+        type=float,
+        default=60.0,
+        help="seconds to wait for another process handling the same video",
+    )
     run_parser.set_defaults(handler=run)
 
     query_parser = commands.add_parser(

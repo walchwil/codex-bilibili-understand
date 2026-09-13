@@ -19,10 +19,11 @@ python <skill-dir>\scripts\pipeline.py run "<bilibili-url>" --start 14:40 --dura
 ~~~
 
 Use --end 15:40 instead of --duration 60 when both endpoints are supplied. The command
-checks full-transcript and clip caches first; on a cache miss it probes, downloads audio
-once, and asks faster-whisper to transcribe only the requested interval plus a small context
-padding. Read the returned segments, cite explicit [mm:ss-mm:ss] evidence, and never open
-the full word-level JSONL for a range question.
+checks subtitle, full-transcript, and clip caches first; when a usable subtitle track exists
+it normalizes VTT cues without loading Whisper. On an ASR cache miss it probes, downloads
+audio once, and asks faster-whisper to transcribe only the requested interval plus a small
+context padding. Read the returned segments, cite explicit [mm:ss-mm:ss] evidence, and never
+open the full word-level JSONL for a range question.
 
 For a broad summary or a request that genuinely needs global context, use:
 
@@ -35,8 +36,8 @@ an already prepared full or clip cache. All commands own cache decisions, finite
 retry, CUDA-to-CPU fallback, atomic artifacts, and per-stage timing. Read their short JSON:
 
 - ready or ok: use the returned artifact/segments;
-- subtitles_available: a track was detected but v0.3 still does not normalize it. Do not
-  claim understanding from metadata; ask before paying for --force-asr;
+- subtitles_available: a track was detected but the explicit `prepare` command did not opt
+  into subtitle normalization; use `--prefer-subtitles` or `--force-asr` deliberately;
 - anti_bot or auth_required: stop automatic retries;
 - network_error, tool_missing, video_unavailable, or an ASR error: report the concise
   diagnostic and failed stage without guessing.
@@ -53,13 +54,14 @@ With no prior cache, the controller starts with small. If sampled key terms are 
 the GPU has capacity, compare the
 same evidence with large-v3-turbo; promote it only when observed text improves. Supply a
 short --hotwords "term one term two" glossary only from the user or known topic context.
-Changing model, language, VAD, or hotwords invalidates the ASR cache. Use --refresh-asr
+Changing model, language, VAD, hotwords, beam size, or word-timestamp mode invalidates the ASR cache. Use --refresh-asr
 only when a deliberate rerun is needed. When none of those options is supplied, preserve
 and reuse the existing ASR configuration instead of downgrading or retranscribing it.
 
-Each clip is keyed by its covered time interval and ASR configuration. Repeated or adjacent
-range questions reuse and merge clip caches. --full is the explicit opt-in for whole-video
-ASR.
+Each clip is keyed by its covered time interval, ASR configuration, and local audio identity.
+Repeated or adjacent range questions reuse and merge clip caches. Segment timestamps are the
+default; add `--word-timestamps` only when the answer needs word-level evidence. `--full` is
+the explicit opt-in for whole-video ASR.
 
 ## Access boundary
 
@@ -85,6 +87,8 @@ transcript.jsonl       complete ASR/debug artifact
 transcript.md          readable transcript
 asr_metadata.json      configuration and ASR facts
 segments.jsonl         compact segment-only source for Codex
+subtitle_segments.jsonl normalized VTT cue source when captions are available
+subtitle_metadata.json  subtitle normalization facts
 pipeline_state.json    stage status, attempts, and timings
 clips/index.json       covered partial-ASR intervals and configurations
 clips/<range>/          transcript and compact segments for one clip

@@ -44,6 +44,28 @@ prompt time range → pipeline.py query → only that excerpt
 segments.jsonl 约 73 KB；查询其中 60 秒只返回约 2.4 KB。这个优化主要减少 Codex
 读取文件时的等待和 token，并不伪装成 ASR 本身变快了。
 
+## v0.4：字幕快路径与运行时硬化
+
+v0.4 在 v0.3 的区间优先 ASR 之上补齐了几项后端基础能力：
+
+- 有原生/自动 VTT 字幕时，优先下载并规范化字幕，不加载 Whisper；字幕失败才回退 ASR；
+- ASR 缓存绑定音频文件的大小/修改时间、模型、语言、VAD、hotwords、beam size 和词级开关；
+- 默认只保留段级时间戳；需要逐词证据时显式加 `--word-timestamps`；
+- 同一个视频使用 `.pipeline.lock` 做有限等待和陈旧锁恢复，避免并发重复下载/占用 GPU；
+- 局部 ASR 支持有限的本地进程重试，并把 clip ASR/compact 耗时写入 `pipeline_state.json` 和 JSON 输出。
+- ASR 元数据额外记录 `model_load_s` 与 `decode_s`，可以先判断瓶颈到底是冷启动还是实际解码。
+
+示例：
+
+~~~powershell
+python $pipeline run "<url>" --start 14:40 --duration 60
+python $pipeline run "<url>" --start 14:40 --duration 60 --word-timestamps
+python $pipeline run "<url>" --start 14:40 --duration 60 --beam-size 3
+~~~
+
+`--word-timestamps` 和较小的 `--beam-size` 都是有取舍的实验开关，不应未经同一片段的
+准确率/耗时对照就直接改成全局默认。
+
 ## v0.3：区间优先的热转写
 
 v0.3 增加了之前规划的 run 入口：
@@ -54,7 +76,7 @@ python $pipeline run "<url>" --start 14:40 --duration 60
 
 它的决策顺序是（命中缓存时不会再次探测或下载）：
 
-- 已有匹配 ASR 配置的完整 transcript：直接读取目标区间；
+- 已有字幕或匹配 ASR 配置的完整 transcript：直接读取目标区间；
 - 没有完整 transcript，但 clip cache 覆盖目标区间：直接拼接已有片段；
 - 目标区间未覆盖：复用已下载音频，只让 faster-whisper 处理目标区间前后各 3 秒；
 - 明确需要全片上下文时：使用 --full。
@@ -131,15 +153,16 @@ python $pipeline prepare "<url>" --model large-v3-turbo --hotwords "GRPO verl �
 ~~~
 
 首次转写默认使用 small。已有转录时，不传 ASR 参数会继承原配置，避免把
-large-v3-turbo 缓存意外降级或重跑。缓存匹配会比较模型、语言、VAD 和 hotwords；
+large-v3-turbo 缓存意外降级或重跑。缓存匹配会比较音频身份、模型、语言、VAD、hotwords、
+beam size 和词级时间戳开关；
 显式改变这些语义配置会重新 ASR，仅切换 GPU/CPU 不会让已有文本失效。明确需要
 重做时使用 --refresh-asr。
 
 prepare 常见状态：
 
 - ready：可以立即 query；
-- subtitles_available：检测到字幕轨道，但 v0.2 尚未归一化；需要时可显式
-  --force-asr；
+- subtitles_available：直接 `prepare` 检测到字幕但未启用字幕优先；可加
+  `--prefer-subtitles`，或用 `--force-asr` 直接走本地 ASR；
 - cached 出现在阶段状态中：该阶段没有重复执行；
 - anti_bot / auth_required：停止自动重试，不会绕过访问控制；
 - network_error / tool_missing / asr_error：查看短诊断和 pipeline_state.json。
@@ -159,6 +182,8 @@ outputs/bilibili-understand/<video-key>/
 ├── transcript.md
 ├── asr_metadata.json
 ├── segments.jsonl
+├── subtitle_segments.jsonl
+├── subtitle_metadata.json
 ├── pipeline_state.json
 ├── clips/
 │   ├── index.json
@@ -172,6 +197,7 @@ outputs/bilibili-understand/<video-key>/
 
 - transcript.jsonl 保留完整 ASR 结果，便于调试和兼容；
 - segments.jsonl 去掉庞大的词级数组，是 Codex 的默认读取源；
+- subtitle_segments.jsonl 是字幕快路径的段级证据源；
 - queries/ 保存实际提问涉及的小片段；
 - pipeline_state.json 保存分阶段耗时、缓存命中、尝试次数和失败位置；
 - metadata.json 不保存临时媒体 URL、Cookie 或分享链接跟踪参数。
@@ -197,15 +223,19 @@ Windows 下脚本会尝试复用当前 Python 环境中 PyTorch 自带的 CUDA D
 
 ## 当前限制与路线图
 
-- 原生字幕目前只检测可用性，尚未统一归一化为 JSONL；
+- 字幕目前支持 VTT 归一化；更复杂的字幕格式仍会回退 ASR；
 - 尚未实现指定秒截帧，因此纯画面信息可能遗漏；
 - 不支持批量爬取，也不会绕过受限、付费或登录内容；
 - v0.3 的 run --start/--duration 已实现区间优先 ASR；首次局部请求仍需要先下载
   完整音频，但不会全量转写；
-- 原生字幕归一化、指定时间截帧和批量爬取仍未实现；
+- 指定时间截帧和批量爬取仍未实现；
 - 不会绕过受限、付费或登录内容。
 
-后续 v0.4 可以继续做原生字幕归一化和画面帧证据；不需要先引入新的 Agent 框架。
+后续可以继续做指定时间帧证据、真正的常驻 Whisper worker 和更多可复现实验；不需要先引入新的
+Agent 框架。
+
+常驻 worker 暂不默认开启：它能省掉模型加载，但会引入进程生命周期、显存占用、空闲回收、
+崩溃重启和多请求隔离问题；先用 `model_load_s`/`decode_s` 证明冷启动确实是主要瓶颈，再引入它。
 
 ## 开发与验证
 

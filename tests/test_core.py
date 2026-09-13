@@ -83,7 +83,7 @@ class PackageTests(unittest.TestCase):
         for manifest in (plugin / "plugin.json", plugin / ".codex-plugin" / "plugin.json"):
             data = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(data["name"], "bilibili-understand")
-            self.assertEqual(data["version"], "0.3.0")
+            self.assertEqual(data["version"], "0.4.0")
 
         marketplace = json.loads(
             (ROOT / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8")
@@ -176,9 +176,44 @@ class PipelineTests(unittest.TestCase):
             "vad_filter": False,
             "hotwords": "实习 技术岗",
         }
-        self.assertEqual(pipeline.resolve_asr_config(args, existing), existing)
+        resolved = pipeline.resolve_asr_config(args, existing)
+        self.assertEqual(resolved["model"], existing["model"])
+        self.assertEqual(resolved["language"], existing["language"])
+        self.assertEqual(resolved["hotwords"], existing["hotwords"])
+        self.assertFalse(resolved["word_timestamps"])
+        self.assertEqual(resolved["beam_size"], 5)
         args.model = "small"
         self.assertEqual(pipeline.resolve_asr_config(args, existing)["model"], "small")
+
+    def test_audio_signature_changes_when_artifact_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audio = Path(temporary) / "audio.m4a"
+            audio.write_bytes(b"first")
+            first = pipeline.audio_signature(audio)
+            audio.write_bytes(b"a different audio artifact")
+            second = pipeline.audio_signature(audio)
+            self.assertNotEqual(first, second)
+
+    def test_video_lock_rejects_duplicate_owner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            video_dir = Path(temporary) / "BVlock"
+            with pipeline.video_lock(video_dir, timeout_s=0):
+                with self.assertRaises(pipeline.PipelineBusy):
+                    with pipeline.video_lock(video_dir, timeout_s=0):
+                        pass
+
+    def test_normalizes_vtt_subtitle_cues(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            subtitle = Path(temporary) / "subtitle.zh.vtt"
+            subtitle.write_text(
+                "WEBVTT\n\n00:00:01.000 --> 00:00:02.500\n"
+                "<c.colorE5E5E5>你好 &amp; 世界</c>\n\n",
+                encoding="utf-8",
+            )
+            records = pipeline.load_subtitle_segments(subtitle)
+            self.assertEqual(records[0]["start_s"], 1.0)
+            self.assertEqual(records[0]["end_s"], 2.5)
+            self.assertEqual(records[0]["text"], "你好 & 世界")
 
     def test_only_network_failures_are_retried(self):
         self.assertTrue(pipeline.should_retry("network_error"))
