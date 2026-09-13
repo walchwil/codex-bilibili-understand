@@ -83,7 +83,7 @@ class PackageTests(unittest.TestCase):
         for manifest in (plugin / "plugin.json", plugin / ".codex-plugin" / "plugin.json"):
             data = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(data["name"], "bilibili-understand")
-            self.assertEqual(data["version"], "0.2.0")
+            self.assertEqual(data["version"], "0.3.0")
 
         marketplace = json.loads(
             (ROOT / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8")
@@ -185,6 +185,31 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(pipeline.should_retry("anti_bot"))
         self.assertFalse(pipeline.should_retry("auth_required"))
         self.assertFalse(pipeline.should_retry("video_unavailable"))
+
+    def test_clip_index_covers_and_merges_requested_range(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            video_dir = Path(temporary) / "BV1clip"
+            segment_path = video_dir / "clips" / "10-30" / "segments.jsonl"
+            segment_path.parent.mkdir(parents=True)
+            segment_path.write_text(
+                '{"start_s":10,"end_s":20,"text":"first"}\n'
+                '{"start_s":20,"end_s":30,"text":"second"}\n',
+                encoding="utf-8",
+            )
+            config = {"model": "small", "language": "zh", "vad_filter": False, "hotwords": None}
+            pipeline.save_clip_entry(
+                video_dir,
+                {
+                    "coverage_start_s": 10,
+                    "coverage_end_s": 30,
+                    "segments_path": "clips/10-30/segments.jsonl",
+                    "config": config,
+                },
+            )
+            entries = pipeline.covered_clip_entries(video_dir, 15, 25, config)
+            self.assertIsNotNone(entries)
+            records = pipeline.records_from_clip_entries(video_dir, entries or [])
+            self.assertEqual([record["text"] for record in records], ["first", "second"])
 
     def test_status_reports_missing_cache_without_writing(self):
         with tempfile.TemporaryDirectory() as temporary:

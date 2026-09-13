@@ -44,6 +44,24 @@ prompt time range → pipeline.py query → only that excerpt
 segments.jsonl 约 73 KB；查询其中 60 秒只返回约 2.4 KB。这个优化主要减少 Codex
 读取文件时的等待和 token，并不伪装成 ASR 本身变快了。
 
+## v0.3：区间优先的热转写
+
+v0.3 增加了之前规划的 run 入口：
+
+~~~powershell
+python $pipeline run "<url>" --start 14:40 --duration 60
+~~~
+
+它的决策顺序是（命中缓存时不会再次探测或下载）：
+
+- 已有匹配 ASR 配置的完整 transcript：直接读取目标区间；
+- 没有完整 transcript，但 clip cache 覆盖目标区间：直接拼接已有片段；
+- 目标区间未覆盖：复用已下载音频，只让 faster-whisper 处理目标区间前后各 3 秒；
+- 明确需要全片上下文时：使用 --full。
+
+这意味着首次局部问题不再先做整段 29 分钟 ASR；但音频仍会完整下载一次，供后续
+区间请求复用。每个 clip 都带 ASR 配置和覆盖范围，不同模型或 hotwords 不会混用。
+
 ## 安装到 Codex
 
 需要 Python 3.10+；推荐 3.12。先把依赖安装到 **Codex 实际使用的同一个
@@ -100,6 +118,8 @@ Codex 会自行解析 Skill 所在目录并调用总控脚本。首次处理无�
 $pipeline = "plugins/bilibili-understand/skills/bilibili-understand/scripts/pipeline.py"
 
 python $pipeline prepare "https://www.bilibili.com/video/BVxxxxxxxxx/"
+python $pipeline run "https://www.bilibili.com/video/BVxxxxxxxxx/" --start 14:40 --duration 60
+python $pipeline run "https://www.bilibili.com/video/BVxxxxxxxxx/" --full
 python $pipeline query "https://www.bilibili.com/video/BVxxxxxxxxx/" --start 14:40 --duration 60
 python $pipeline status "https://www.bilibili.com/video/BVxxxxxxxxx/"
 ~~~
@@ -140,6 +160,12 @@ outputs/bilibili-understand/<video-key>/
 ├── asr_metadata.json
 ├── segments.jsonl
 ├── pipeline_state.json
+├── clips/
+│   ├── index.json
+│   └── <start-ms>-<end-ms>/
+│       ├── transcript.jsonl
+│       ├── segments.jsonl
+│       └── asr_metadata.json
 └── queries/
     └── <start-ms>-<end-ms>.jsonl
 ~~~
@@ -174,12 +200,12 @@ Windows 下脚本会尝试复用当前 Python 环境中 PyTorch 自带的 CUDA D
 - 原生字幕目前只检测可用性，尚未统一归一化为 JSONL；
 - 尚未实现指定秒截帧，因此纯画面信息可能遗漏；
 - 不支持批量爬取，也不会绕过受限、付费或登录内容；
-- **v0.2 的首次 ASR 仍是全量转写**。query 只减少后续读取范围和 token。
+- v0.3 的 run --start/--duration 已实现区间优先 ASR；首次局部请求仍需要先下载
+  完整音频，但不会全量转写；
+- 原生字幕归一化、指定时间截帧和批量爬取仍未实现；
+- 不会绕过受限、付费或登录内容。
 
-计划中的 v0.3 是“热转写”：Codex 根据用户意图调用同一工具时传入 start/end 或
-full。局部问题只下载/转写对应音频区间；只有确实需要全片上下文时才全量处理。
-这会建立在 faster-whisper 的 clip_timestamps、片段级缓存和按范围补洞上，而不是
-先引入一个昂贵的新 Agent 框架。
+后续 v0.4 可以继续做原生字幕归一化和画面帧证据；不需要先引入新的 Agent 框架。
 
 ## 开发与验证
 

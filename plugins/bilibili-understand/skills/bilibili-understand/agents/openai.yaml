@@ -1,4 +1,4 @@
 interface:
   display_name: "Bilibili Understand"
-  short_description: "Query Bilibili videos with cached timestamp evidence"
-  default_prompt: "Use $bilibili-understand to prepare this Bilibili video once, read only the transcript range needed for my question, and cite second-level timestamps."
+  short_description: "Hot-transcribe only the Bilibili range needed"
+  default_prompt: "Use $bilibili-understand to transcribe only the requested Bilibili time range when possible, use full context only when necessary, and cite second-level timestamps."

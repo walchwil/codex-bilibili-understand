@@ -73,6 +73,8 @@ def run_whisper(
     compute_type: str,
     vad_filter: bool,
     hotwords: str | None,
+    clip_start: float | None = None,
+    clip_end: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     prepare_runtime(device)
     from faster_whisper import WhisperModel
@@ -83,12 +85,16 @@ def run_whisper(
         compute_type=compute_type,
         download_root=str(model_cache),
     )
+    clip_timestamps = (
+        f"{clip_start},{clip_end}" if clip_start is not None and clip_end is not None else "0"
+    )
     segments, info = model.transcribe(
         str(audio_path),
         language=language,
         vad_filter=vad_filter,
         word_timestamps=True,
         hotwords=hotwords,
+        clip_timestamps=clip_timestamps,
     )
 
     records = []
@@ -119,6 +125,8 @@ def run_whisper(
         "compute_type": compute_type,
         "vad_filter": vad_filter,
         "hotwords": hotwords,
+        "clip_start_s": clip_start,
+        "clip_end_s": clip_end,
         "language": getattr(info, "language", language),
         "language_probability": getattr(info, "language_probability", None),
         "duration_s": getattr(info, "duration", None),
@@ -137,6 +145,23 @@ def transcribe(args: argparse.Namespace) -> int:
     if not args.audio.is_file():
         print(json.dumps({"status": "invalid_audio", "path": str(args.audio)}))
         return 2
+    if (args.clip_start is None) != (args.clip_end is None):
+        print(
+            json.dumps(
+                {"status": "invalid_clip", "message": "clip start and end must be provided together"}
+            )
+        )
+        return 2
+    if (
+        args.clip_start is not None
+        and (args.clip_start < 0 or args.clip_end <= args.clip_start)
+    ):
+        print(
+            json.dumps(
+                {"status": "invalid_clip", "message": "clip end must be after non-negative start"}
+            )
+        )
+        return 2
 
     try:
         records, details = run_whisper(
@@ -148,6 +173,8 @@ def transcribe(args: argparse.Namespace) -> int:
             args.compute_type,
             args.vad_filter,
             args.hotwords,
+            args.clip_start,
+            args.clip_end,
         )
     except ImportError:
         print(
@@ -179,6 +206,8 @@ def transcribe(args: argparse.Namespace) -> int:
             "int8",
             args.vad_filter,
             args.hotwords,
+            args.clip_start,
+            args.clip_end,
         )
 
     if not records:
@@ -232,6 +261,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--hotwords",
         help="space-separated terms known from the title or user-provided context",
     )
+    parser.add_argument("--clip-start", type=float)
+    parser.add_argument("--clip-end", type=float)
     parser.add_argument(
         "--no-cpu-fallback",
         action="store_false",

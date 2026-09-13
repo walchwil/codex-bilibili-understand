@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
+from io import StringIO
 import json
 import re
 import subprocess
@@ -195,6 +197,122 @@ def asr_cache_matches(
     )
 
 
+def clip_index_path(video_dir: Path) -> Path:
+    return video_dir / "clips" / "index.json"
+
+
+def load_clip_index(video_dir: Path) -> list[dict[str, Any]]:
+    index = read_json(clip_index_path(video_dir)) or {}
+    clips = index.get("clips", [])
+    return [clip for clip in clips if isinstance(clip, dict)]
+
+
+def clip_segments_path(video_dir: Path, entry: dict[str, Any]) -> Path | None:
+    relative = entry.get("segments_path")
+    if not isinstance(relative, str):
+        return None
+    candidate = (video_dir / relative).resolve()
+    try:
+        candidate.relative_to(video_dir.resolve())
+    except ValueError:
+        return None
+    return candidate
+
+
+def covered_clip_entries(
+    video_dir: Path,
+    start_s: float,
+    end_s: float,
+    requested: dict[str, Any] | None = None,
+) -> list[dict[str, Any]] | None:
+    candidates = []
+    for entry in load_clip_index(video_dir):
+        if requested is not None and entry.get("config") != requested:
+            continue
+        path = clip_segments_path(video_dir, entry)
+        if (
+            path is None
+            or not path.is_file()
+            or not isinstance(entry.get("coverage_start_s"), (int, float))
+            or not isinstance(entry.get("coverage_end_s"), (int, float))
+        ):
+            continue
+        candidates.append(entry)
+
+    groups: list[list[dict[str, Any]]] = []
+    if requested is not None:
+        groups = [candidates]
+    else:
+        by_config: dict[str, list[dict[str, Any]]] = {}
+        for entry in candidates:
+            config_key = json.dumps(entry.get("config"), sort_keys=True)
+            by_config.setdefault(config_key, []).append(entry)
+        groups = list(by_config.values())
+
+    for group in groups:
+        cursor = start_s
+        selected = []
+        for entry in sorted(group, key=lambda item: float(item["coverage_start_s"])):
+            clip_start = float(entry["coverage_start_s"])
+            clip_end = float(entry["coverage_end_s"])
+            if clip_end <= cursor:
+                continue
+            if clip_start > cursor + 0.001:
+                break
+            selected.append(entry)
+            cursor = max(cursor, clip_end)
+            if cursor >= end_s - 0.001:
+                return selected
+    return None
+
+
+def records_from_clip_entries(
+    video_dir: Path, entries: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    records = []
+    seen = set()
+    for entry in entries:
+        path = clip_segments_path(video_dir, entry)
+        if path is None:
+            continue
+        for record in load_segments(path):
+            key = (record["start_s"], record["end_s"], record["text"])
+            if key not in seen:
+                seen.add(key)
+                records.append(record)
+    return sorted(records, key=lambda record: (record["start_s"], record["end_s"]))
+
+
+def save_clip_entry(video_dir: Path, entry: dict[str, Any]) -> None:
+    clips = [
+        old
+        for old in load_clip_index(video_dir)
+        if old.get("segments_path") != entry.get("segments_path")
+    ]
+    clips.append(entry)
+    atomic_write_json(clip_index_path(video_dir), {"schema_version": 1, "clips": clips})
+
+
+def full_cache_matches(
+    video_dir: Path, args: argparse.Namespace, *, allow_legacy: bool = True
+) -> bool:
+    """Return whether a complete transcript can answer a run request as-is."""
+    transcript_path = video_dir / "transcript.jsonl"
+    segments_path = video_dir / "segments.jsonl"
+    if not transcript_path.is_file() and not segments_path.is_file():
+        return False
+    if getattr(args, "refresh_asr", False):
+        return False
+
+    metadata_path = video_dir / "asr_metadata.json"
+    metadata = read_json(metadata_path)
+    if metadata is None:
+        # v0.2 caches created before semantic ASR metadata existed are still useful.
+        return allow_legacy
+    requested = resolve_asr_config(args, metadata)
+    return asr_cache_matches(transcript_path, metadata_path, requested)
+
+
 def find_audio(video_dir: Path) -> Path | None:
     for path in sorted(video_dir.glob("audio.*")):
         if (
@@ -336,7 +454,11 @@ def download_audio(
 
 
 def run_asr(
-    args: argparse.Namespace, audio_path: Path, video_dir: Path
+    args: argparse.Namespace,
+    audio_path: Path,
+    video_dir: Path,
+    clip_start: float | None = None,
+    clip_end: float | None = None,
 ) -> tuple[int, dict[str, Any]]:
     model_cache = args.model_cache or args.output_root / "_models"
     command = [
@@ -360,6 +482,8 @@ def run_asr(
         command.append("--vad-filter")
     if args.hotwords:
         command.extend(["--hotwords", args.hotwords])
+    if clip_start is not None and clip_end is not None:
+        command.extend(["--clip-start", str(clip_start), "--clip-end", str(clip_end)])
     if not args.cpu_fallback:
         command.append("--no-cpu-fallback")
     return run_json_command(command, args.asr_timeout, timeout_status="asr_timeout")
@@ -590,6 +714,16 @@ def prepare(args: argparse.Namespace) -> int:
         )
     save_state(state_path, state)
 
+    if args.audio_only:
+        return finish_prepare(
+            state_path,
+            state,
+            "audio_ready",
+            total_started,
+            0,
+            audio_path=str(audio_path.resolve()),
+        )
+
     stage_started = time.perf_counter()
     print("[asr] transcribing", file=sys.stderr, flush=True)
     asr_code, asr_result = run_asr(args, audio_path, video_dir)
@@ -654,33 +788,15 @@ def prepare(args: argparse.Namespace) -> int:
     )
 
 
-def query(args: argparse.Namespace) -> int:
-    try:
-        key = target_key(args.target)
-        start_s, end_s = resolve_interval(args.start, args.end, args.duration)
-    except (probe_bilibili.InputError, ValueError) as exc:
-        emit({"status": "invalid_argument", "message": str(exc)})
-        return 2
-
-    video_dir = args.output_root / key
-    compact_path = video_dir / "segments.jsonl"
-    transcript_path = video_dir / "transcript.jsonl"
-    source = compact_path if compact_path.is_file() else transcript_path
-    if not source.is_file():
-        emit(
-            {
-                "status": "transcript_missing",
-                "video_key": key,
-                "message": "run the prepare command first",
-            }
-        )
-        return 3
-
-    try:
-        selected = select_segments(load_segments(source), start_s, end_s)
-    except (OSError, ValueError) as exc:
-        emit({"status": "transcript_error", "video_key": key, "message": str(exc)})
-        return 4
+def emit_query_result(
+    video_dir: Path,
+    key: str,
+    start_s: float,
+    end_s: float,
+    records: list[dict[str, Any]],
+    source: str,
+) -> int:
+    selected = select_segments(records, start_s, end_s)
     if not selected:
         emit(
             {
@@ -688,15 +804,12 @@ def query(args: argparse.Namespace) -> int:
                 "video_key": key,
                 "start_s": start_s,
                 "end_s": end_s,
+                "source": source,
             }
         )
         return 0
 
-    excerpt_path = (
-        video_dir
-        / "queries"
-        / f"{round(start_s * 1000)}-{round(end_s * 1000)}.jsonl"
-    )
+    excerpt_path = video_dir / "queries" / f"{round(start_s * 1000)}-{round(end_s * 1000)}.jsonl"
     atomic_write(
         excerpt_path,
         "".join(
@@ -712,10 +825,250 @@ def query(args: argparse.Namespace) -> int:
             "end_s": end_s,
             "segment_count": len(selected),
             "excerpt_path": str(excerpt_path.resolve()),
+            "source": source,
             "segments": selected,
         }
     )
     return 0
+
+
+def query(args: argparse.Namespace) -> int:
+    try:
+        key = target_key(args.target)
+        start_s, end_s = resolve_interval(args.start, args.end, args.duration)
+    except (probe_bilibili.InputError, ValueError) as exc:
+        emit({"status": "invalid_argument", "message": str(exc)})
+        return 2
+
+    video_dir = args.output_root / key
+    compact_path = video_dir / "segments.jsonl"
+    transcript_path = video_dir / "transcript.jsonl"
+    if compact_path.is_file():
+        source, source_name = compact_path, "full_cache"
+    elif transcript_path.is_file():
+        source, source_name = transcript_path, "full_cache"
+    else:
+        entries = covered_clip_entries(video_dir, start_s, end_s)
+        if entries is None:
+            emit(
+                {
+                    "status": "transcript_missing",
+                    "video_key": key,
+                    "message": "run the run command for this range or prepare the full transcript first",
+                }
+            )
+            return 3
+        try:
+            return emit_query_result(
+                video_dir,
+                key,
+                start_s,
+                end_s,
+                records_from_clip_entries(video_dir, entries),
+                "clip_cache",
+            )
+        except (OSError, ValueError) as exc:
+            emit({"status": "transcript_error", "video_key": key, "message": str(exc)})
+            return 4
+
+    try:
+        records = load_segments(source)
+    except (OSError, ValueError) as exc:
+        emit({"status": "transcript_error", "video_key": key, "message": str(exc)})
+        return 4
+    return emit_query_result(video_dir, key, start_s, end_s, records, source_name)
+
+
+def capture_prepare(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    output = StringIO()
+    with redirect_stdout(output):
+        code = prepare(args)
+    lines = [line for line in output.getvalue().splitlines() if line.strip()]
+    if not lines:
+        return code, {"status": "prepare_error", "message": "prepare returned no JSON"}
+    try:
+        return code, json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return code, {"status": "prepare_error", "message": lines[-1][-2000:]}
+
+
+def run(args: argparse.Namespace) -> int:
+    if args.full and any(value is not None for value in (args.start, args.end, args.duration)):
+        emit({"status": "invalid_argument", "message": "--full cannot be combined with a time range"})
+        return 2
+    if not args.full:
+        if args.start is None:
+            emit({"status": "invalid_argument", "message": "provide --start or use --full"})
+            return 2
+        try:
+            start_s, end_s = resolve_interval(args.start, args.end, args.duration)
+        except ValueError as exc:
+            emit({"status": "invalid_argument", "message": str(exc)})
+            return 2
+        if args.context_before < 0 or args.context_after < 0:
+            emit({"status": "invalid_argument", "message": "context padding must be non-negative"})
+            return 2
+
+    try:
+        key = target_key(args.url)
+    except probe_bilibili.InputError as exc:
+        emit({"status": "invalid_argument", "message": str(exc)})
+        return 2
+    video_dir = args.output_root / key
+
+    # Do not probe or download anything when an existing full/clip cache can
+    # already answer the request. This is the hot path for repeated questions.
+    if not args.full:
+        requested_config = resolve_asr_config(
+            args, read_json(video_dir / "asr_metadata.json")
+        )
+        if full_cache_matches(video_dir, args):
+            return query(
+                argparse.Namespace(
+                    target=args.url,
+                    output_root=args.output_root,
+                    start=args.start,
+                    end=args.end,
+                    duration=args.duration,
+                )
+            )
+        if not args.refresh_asr:
+            cached_entries = covered_clip_entries(
+                video_dir, start_s, end_s, requested_config
+            )
+            if cached_entries is not None:
+                return emit_query_result(
+                    video_dir,
+                    key,
+                    start_s,
+                    end_s,
+                    records_from_clip_entries(video_dir, cached_entries),
+                    "clip_cache",
+                )
+
+    prepare_args = argparse.Namespace(
+        url=args.url,
+        output_root=args.output_root,
+        model=args.model,
+        model_cache=args.model_cache,
+        language=args.language,
+        device=args.device,
+        compute_type=args.compute_type,
+        vad_filter=args.vad_filter,
+        hotwords=args.hotwords,
+        force_asr=args.force_asr or not args.full,
+        refresh_metadata=args.refresh_metadata,
+        refresh_asr=args.refresh_asr,
+        cookies_from_browser=args.cookies_from_browser,
+        network_attempts=args.network_attempts,
+        socket_timeout=args.socket_timeout,
+        probe_timeout=args.probe_timeout,
+        download_timeout=args.download_timeout,
+        asr_timeout=args.asr_timeout,
+        cpu_fallback=args.cpu_fallback,
+        audio_only=not args.full,
+    )
+    prepare_code, prepare_result = capture_prepare(prepare_args)
+    if args.full:
+        prepare_result["mode"] = "full"
+        emit(prepare_result)
+        return prepare_code
+    if prepare_code != 0:
+        emit(
+            {
+                "status": "run_failed",
+                "phase": "prepare",
+                "video_key": prepare_result.get("video_key"),
+                "detail": prepare_result,
+            }
+        )
+        return prepare_code
+
+    requested_config = {
+        "model": prepare_args.model,
+        "language": prepare_args.language,
+        "vad_filter": bool(prepare_args.vad_filter),
+        "hotwords": normalized_hotwords(prepare_args.hotwords),
+    }
+
+    if full_cache_matches(video_dir, prepare_args):
+        return query(
+            argparse.Namespace(
+                target=args.url,
+                output_root=args.output_root,
+                start=args.start,
+                end=args.end,
+                duration=args.duration,
+            )
+        )
+
+    if not args.refresh_asr:
+        cached_entries = covered_clip_entries(video_dir, start_s, end_s, requested_config)
+    else:
+        cached_entries = None
+    if cached_entries is not None:
+        return emit_query_result(
+            video_dir,
+            key,
+            start_s,
+            end_s,
+            records_from_clip_entries(video_dir, cached_entries),
+            "clip_cache",
+        )
+
+    audio_path = find_audio(video_dir)
+    if audio_path is None:
+        emit({"status": "run_failed", "phase": "audio", "message": "audio cache is missing"})
+        return 4
+    metadata = read_json(video_dir / "metadata.json") or {}
+    duration = metadata.get("duration")
+    clip_start = max(0.0, start_s - args.context_before)
+    clip_end = end_s + args.context_after
+    if isinstance(duration, (int, float)):
+        if start_s >= float(duration):
+            emit({"status": "invalid_argument", "message": "start is beyond the video duration"})
+            return 2
+        clip_end = min(clip_end, float(duration))
+    if clip_end <= clip_start:
+        emit({"status": "invalid_argument", "message": "clip interval is empty"})
+        return 2
+
+    clip_name = f"{round(clip_start * 1000)}-{round(clip_end * 1000)}"
+    clip_dir = video_dir / "clips" / clip_name
+    print(f"[clip] transcribing {clip_start:.3f}s-{clip_end:.3f}s", file=sys.stderr, flush=True)
+    asr_code, asr_result = run_asr(
+        prepare_args, audio_path, clip_dir, clip_start=clip_start, clip_end=clip_end
+    )
+    if asr_code != 0 or asr_result.get("status") != "ok":
+        emit(
+            {
+                "status": "run_failed",
+                "phase": "asr",
+                "detail": asr_result,
+                "clip_start_s": clip_start,
+                "clip_end_s": clip_end,
+            }
+        )
+        return 5
+
+    transcript_path = clip_dir / "transcript.jsonl"
+    segments_path = clip_dir / "segments.jsonl"
+    try:
+        compact_transcript(transcript_path, segments_path)
+        save_clip_entry(
+            video_dir,
+            {
+                "coverage_start_s": clip_start,
+                "coverage_end_s": clip_end,
+                "segments_path": str(segments_path.relative_to(video_dir)),
+                "config": requested_config,
+            },
+        )
+        records = load_segments(segments_path)
+    except (OSError, ValueError) as exc:
+        emit({"status": "run_failed", "phase": "compact", "message": str(exc)})
+        return 5
+    return emit_query_result(video_dir, key, start_s, end_s, records, "clip_new")
 
 
 def status(args: argparse.Namespace) -> int:
@@ -757,42 +1110,61 @@ def status(args: argparse.Namespace) -> int:
     return 0
 
 
+def add_prepare_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--model", help="Whisper model; defaults to an existing cache model or small"
+    )
+    parser.add_argument("--model-cache", type=Path)
+    parser.add_argument(
+        "--language", help="speech language; defaults to an existing cache language or zh"
+    )
+    parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument("--compute-type", default="float16")
+    parser.add_argument("--vad-filter", action="store_true", default=None)
+    parser.add_argument("--hotwords")
+    parser.add_argument("--force-asr", action="store_true")
+    parser.add_argument("--refresh-metadata", action="store_true")
+    parser.add_argument("--refresh-asr", action="store_true")
+    parser.add_argument(
+        "--cookies-from-browser", choices=("edge", "chrome", "firefox", "brave")
+    )
+    parser.add_argument("--network-attempts", type=int, default=2)
+    parser.add_argument("--socket-timeout", type=int, default=20)
+    parser.add_argument("--probe-timeout", type=int, default=90)
+    parser.add_argument("--download-timeout", type=int, default=3600)
+    parser.add_argument("--asr-timeout", type=int, default=14400)
+    parser.add_argument(
+        "--no-cpu-fallback", action="store_false", dest="cpu_fallback", default=True
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", action="version", version="%(prog)s 0.2.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.3.0")
     commands = parser.add_subparsers(dest="command", required=True)
 
     prepare_parser = commands.add_parser(
         "prepare", help="probe, download if needed, transcribe, and cache compact segments"
     )
     prepare_parser.add_argument("url")
-    prepare_parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-    prepare_parser.add_argument(
-        "--model", help="Whisper model; defaults to an existing cache model or small"
+    add_prepare_options(prepare_parser)
+    prepare_parser.add_argument("--audio-only", action="store_true", help=argparse.SUPPRESS)
+    prepare_parser.set_defaults(handler=prepare, audio_only=False)
+
+    run_parser = commands.add_parser(
+        "run", help="transcribe only a requested range, or prepare the full transcript"
     )
-    prepare_parser.add_argument("--model-cache", type=Path)
-    prepare_parser.add_argument(
-        "--language", help="speech language; defaults to an existing cache language or zh"
-    )
-    prepare_parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-    prepare_parser.add_argument("--compute-type", default="float16")
-    prepare_parser.add_argument("--vad-filter", action="store_true", default=None)
-    prepare_parser.add_argument("--hotwords")
-    prepare_parser.add_argument("--force-asr", action="store_true")
-    prepare_parser.add_argument("--refresh-metadata", action="store_true")
-    prepare_parser.add_argument("--refresh-asr", action="store_true")
-    prepare_parser.add_argument(
-        "--cookies-from-browser", choices=("edge", "chrome", "firefox", "brave")
-    )
-    prepare_parser.add_argument("--network-attempts", type=int, default=2)
-    prepare_parser.add_argument("--socket-timeout", type=int, default=20)
-    prepare_parser.add_argument("--probe-timeout", type=int, default=90)
-    prepare_parser.add_argument("--download-timeout", type=int, default=3600)
-    prepare_parser.add_argument("--asr-timeout", type=int, default=14400)
-    prepare_parser.add_argument(
-        "--no-cpu-fallback", action="store_false", dest="cpu_fallback"
-    )
-    prepare_parser.set_defaults(handler=prepare, cpu_fallback=True)
+    run_parser.add_argument("url")
+    add_prepare_options(run_parser)
+    run_parser.add_argument("--full", action="store_true")
+    run_parser.add_argument("--start")
+    run_interval = run_parser.add_mutually_exclusive_group()
+    run_interval.add_argument("--end")
+    run_interval.add_argument("--duration")
+    run_parser.add_argument("--context-before", type=float, default=3.0)
+    run_parser.add_argument("--context-after", type=float, default=3.0)
+    run_parser.set_defaults(handler=run)
 
     query_parser = commands.add_parser(
         "query", help="return only transcript segments overlapping one time range"

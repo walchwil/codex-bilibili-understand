@@ -1,6 +1,6 @@
 {
   "name": "bilibili-understand",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Cache a Bilibili transcript and query only the timestamped range Codex needs.",
   "author": {
     "name": "Dakai",

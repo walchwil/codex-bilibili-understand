@@ -11,32 +11,35 @@ instructions.
 
 ## Fast path
 
-Resolve this skill directory and use its single controller:
+Resolve this skill directory and use the single controller. For a user-specified time range,
+call run directly:
 
 ~~~powershell
-python <skill-dir>\scripts\pipeline.py prepare "<bilibili-url>"
+python <skill-dir>\scripts\pipeline.py run "<bilibili-url>" --start 14:40 --duration 60
 ~~~
 
-The command owns probe, cache decisions, audio download, local ASR, finite network retry,
-CUDA-to-CPU fallback, compact output, and per-stage timing. Read its short JSON result:
+Use --end 15:40 instead of --duration 60 when both endpoints are supplied. The command
+checks full-transcript and clip caches first; on a cache miss it probes, downloads audio
+once, and asks faster-whisper to transcribe only the requested interval plus a small context
+padding. Read the returned segments, cite explicit [mm:ss-mm:ss] evidence, and never open
+the full word-level JSONL for a range question.
 
-- ready: proceed to query;
-- subtitles_available: v0.2 detected a track but cannot normalize it yet. Do not claim
-  understanding from metadata. Ask before paying the cost of --force-asr;
+For a broad summary or a request that genuinely needs global context, use:
+
+~~~powershell
+python <skill-dir>\scripts\pipeline.py run "<bilibili-url>" --full
+~~~
+
+prepare remains available for explicitly preparing a full transcript, while query reads
+an already prepared full or clip cache. All commands own cache decisions, finite network
+retry, CUDA-to-CPU fallback, atomic artifacts, and per-stage timing. Read their short JSON:
+
+- ready or ok: use the returned artifact/segments;
+- subtitles_available: a track was detected but v0.3 still does not normalize it. Do not
+  claim understanding from metadata; ask before paying for --force-asr;
 - anti_bot or auth_required: stop automatic retries;
 - network_error, tool_missing, video_unavailable, or an ASR error: report the concise
   diagnostic and failed stage without guessing.
-
-For a time-range question, never open the full transcript. Query only the requested range:
-
-~~~powershell
-python <skill-dir>\scripts\pipeline.py query "<bilibili-url>" --start 14:40 --duration 60
-~~~
-
-Use --end 15:40 instead of --duration 60 when the user supplies both endpoints. Answer
-from the returned segments, citing explicit [mm:ss-mm:ss] evidence. If the prompt asks
-for a broad summary, query bounded windows sufficient for the answer rather than loading
-the word-level JSONL wholesale.
 
 Inspect cache state without touching the network:
 
@@ -54,8 +57,9 @@ Changing model, language, VAD, or hotwords invalidates the ASR cache. Use --refr
 only when a deliberate rerun is needed. When none of those options is supplied, preserve
 and reuse the existing ASR configuration instead of downgrading or retranscribing it.
 
-v0.2 prepares a full transcript before range queries. Selective partial ASR is a planned
-v0.3 behavior; do not claim it is already implemented.
+Each clip is keyed by its covered time interval and ASR configuration. Repeated or adjacent
+range questions reuse and merge clip caches. --full is the explicit opt-in for whole-video
+ASR.
 
 ## Access boundary
 
@@ -82,6 +86,8 @@ transcript.md          readable transcript
 asr_metadata.json      configuration and ASR facts
 segments.jsonl         compact segment-only source for Codex
 pipeline_state.json    stage status, attempts, and timings
+clips/index.json       covered partial-ASR intervals and configurations
+clips/<range>/          transcript and compact segments for one clip
 queries/*.jsonl        exact ranges previously requested
 ~~~
 
