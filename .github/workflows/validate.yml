@@ -20,4 +20,5 @@ jobs:
           python -m unittest discover -s tests -v
           python -m py_compile \
             plugins/bilibili-understand/skills/bilibili-understand/scripts/probe_bilibili.py \
-            plugins/bilibili-understand/skills/bilibili-understand/scripts/transcribe_audio.py
+            plugins/bilibili-understand/skills/bilibili-understand/scripts/transcribe_audio.py \
+            plugins/bilibili-understand/skills/bilibili-understand/scripts/pipeline.py

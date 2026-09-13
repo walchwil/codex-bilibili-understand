@@ -1,7 +1,7 @@
 {
   "name": "bilibili-understand",
-  "version": "0.1.0",
-  "description": "Turn one Bilibili video into evidence-backed, second-level timestamps.",
+  "version": "0.2.0",
+  "description": "Cache a Bilibili transcript and query only the timestamped range Codex needs.",
   "author": {
     "name": "Dakai",
     "url": "https://github.com/walchwil"
@@ -14,7 +14,7 @@
   "interface": {
     "displayName": "Bilibili Understand",
     "shortDescription": "Understand Bilibili videos with timestamped evidence",
-    "longDescription": "Probe one Bilibili URL safely, prefer existing subtitles, and fall back to local Whisper transcription with segment and word timestamps.",
+    "longDescription": "Prepare one Bilibili URL through a cached local pipeline, then return only the timestamped transcript range needed for the question.",
     "developerName": "Dakai",
     "category": "Productivity",
     "capabilities": ["Read", "Write"],

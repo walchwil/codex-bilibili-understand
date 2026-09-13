@@ -114,6 +114,7 @@ def run_whisper(
 
     details = {
         "model": model_name,
+        "requested_language": language,
         "device": device,
         "compute_type": compute_type,
         "vad_filter": vad_filter,

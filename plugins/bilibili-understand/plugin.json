@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "bilibili-understand",
-  "version": "0.1.0",
-  "description": "Turn one Bilibili video into evidence-backed, second-level timestamps.",
+  "version": "0.2.0",
+  "description": "Cache a Bilibili transcript and query only the timestamped range Codex needs.",
   "author": {
     "name": "Dakai",
     "url": "https://github.com/walchwil"
