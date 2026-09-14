@@ -58,9 +58,9 @@ v0.4 在 v0.3 的区间优先 ASR 之上补齐了几项后端基础能力：
 示例：
 
 ~~~powershell
-python $pipeline run "<url>" --start 14:40 --duration 60
-python $pipeline run "<url>" --start 14:40 --duration 60 --word-timestamps
-python $pipeline run "<url>" --start 14:40 --duration 60 --beam-size 3
+uv run --project plugins/bilibili-understand --locked python plugins/bilibili-understand/skills/bilibili-understand/scripts/pipeline.py run "<url>" --start 14:40 --duration 60
+uv run --project plugins/bilibili-understand --locked python plugins/bilibili-understand/skills/bilibili-understand/scripts/pipeline.py run "<url>" --start 14:40 --duration 60 --word-timestamps
+uv run --project plugins/bilibili-understand --locked python plugins/bilibili-understand/skills/bilibili-understand/scripts/pipeline.py run "<url>" --start 14:40 --duration 60 --beam-size 3
 ~~~
 
 `--word-timestamps` 和较小的 `--beam-size` 都是有取舍的实验开关，不应未经同一片段的
@@ -71,7 +71,7 @@ python $pipeline run "<url>" --start 14:40 --duration 60 --beam-size 3
 v0.3 增加了之前规划的 run 入口：
 
 ~~~powershell
-python $pipeline run "<url>" --start 14:40 --duration 60
+uv run --project plugins/bilibili-understand --locked python plugins/bilibili-understand/skills/bilibili-understand/scripts/pipeline.py run "<url>" --start 14:40 --duration 60
 ~~~
 
 它的决策顺序是（命中缓存时不会再次探测或下载）：
@@ -84,23 +84,29 @@ python $pipeline run "<url>" --start 14:40 --duration 60
 这意味着首次局部问题不再先做整段 29 分钟 ASR；但音频仍会完整下载一次，供后续
 区间请求复用。每个 clip 都带 ASR 配置和覆盖范围，不同模型或 hotwords 不会混用。
 
-## 安装到 Codex
+## v0.5：隔离运行时与可诊断安装
 
-需要 Python 3.10+；推荐 3.12。先把依赖安装到 **Codex 实际使用的同一个
-Python/Conda 环境**：
+v0.5 不再要求用户把依赖安装到 base 或任意当前 Python 环境。插件自带
+`pyproject.toml`、`.python-version` 和 `uv.lock`，所有运行都通过 `uv run` 使用插件
+自己的 `.venv`。`requirements.txt` 仍保留给旧版手动开发流程，但不是推荐入口。
+
+陌生用户只需要安装 [uv](https://docs.astral.sh/uv/getting-started/installation/) 和
+Codex：
 
 ~~~powershell
-python -m pip install -r https://raw.githubusercontent.com/walchwil/codex-bilibili-understand/main/plugins/bilibili-understand/requirements.txt
+winget install --id=astral-sh.uv -e
+uv --version
 ~~~
 
 然后添加 GitHub marketplace 并安装插件：
 
 ~~~powershell
-codex plugin marketplace add walchwil/codex-bilibili-understand --ref main
+codex plugin marketplace add walchwil/codex-bilibili-understand --ref v0.5.0
 codex plugin add bilibili-understand@bilibili-tools
 ~~~
 
-重启 Codex，或至少新建一个对话，让新 Skill 被发现。安装命令遵循
+首次使用 Skill 时，它会通过锁定的 uv 项目环境运行 `doctor.py` 和流水线，不会修改
+用户的 base/Conda 环境。重启 Codex，或至少新建一个对话，让新 Skill 被发现。安装命令遵循
 [OpenAI 官方插件文档](https://developers.openai.com/plugins/build/plugins)。
 
 ### Clone 后本地安装
@@ -108,10 +114,15 @@ codex plugin add bilibili-understand@bilibili-tools
 ~~~powershell
 git clone https://github.com/walchwil/codex-bilibili-understand.git
 cd codex-bilibili-understand
-python -m pip install -r plugins/bilibili-understand/requirements.txt
+uv sync --project plugins/bilibili-understand --locked
+uv run --project plugins/bilibili-understand --locked python plugins/bilibili-understand/skills/bilibili-understand/scripts/doctor.py
 codex plugin marketplace add .
 codex plugin add bilibili-understand@bilibili-tools
 ~~~
+
+Windows 也可以运行 `plugins/bilibili-understand/setup.ps1`；Linux/macOS 运行
+`plugins/bilibili-understand/setup.sh`。两个脚本只创建或更新插件自己的 `.venv`，并
+在安装后执行一次无网络的健康检查。
 
 ## 交给 Codex 使用
 
@@ -137,20 +148,31 @@ Codex 会自行解析 Skill 所在目录并调用总控脚本。首次处理无�
 下面的命令便于开发、排错或理解实际链路：
 
 ~~~powershell
-$pipeline = "plugins/bilibili-understand/skills/bilibili-understand/scripts/pipeline.py"
+$pluginRoot = "plugins/bilibili-understand"
+$pipeline = "$pluginRoot/skills/bilibili-understand/scripts/pipeline.py"
 
-python $pipeline prepare "https://www.bilibili.com/video/BVxxxxxxxxx/"
-python $pipeline run "https://www.bilibili.com/video/BVxxxxxxxxx/" --start 14:40 --duration 60
-python $pipeline run "https://www.bilibili.com/video/BVxxxxxxxxx/" --full
-python $pipeline query "https://www.bilibili.com/video/BVxxxxxxxxx/" --start 14:40 --duration 60
-python $pipeline status "https://www.bilibili.com/video/BVxxxxxxxxx/"
+uv run --project $pluginRoot --locked python $pipeline prepare "https://www.bilibili.com/video/BVxxxxxxxxx/"
+uv run --project $pluginRoot --locked python $pipeline run "https://www.bilibili.com/video/BVxxxxxxxxx/" --start 14:40 --duration 60
+uv run --project $pluginRoot --locked python $pipeline run "https://www.bilibili.com/video/BVxxxxxxxxx/" --full
+uv run --project $pluginRoot --locked python $pipeline query "https://www.bilibili.com/video/BVxxxxxxxxx/" --start 14:40 --duration 60
+uv run --project $pluginRoot --locked python $pipeline status "https://www.bilibili.com/video/BVxxxxxxxxx/"
 ~~~
 
 已知专有名词可以作为短 hotwords 传入：
 
 ~~~powershell
-python $pipeline prepare "<url>" --model large-v3-turbo --hotwords "GRPO verl 优势函数"
+uv run --project $pluginRoot --locked python $pipeline prepare "<url>" --model large-v3-turbo --hotwords "GRPO verl 优势函数"
 ~~~
+
+健康检查：
+
+~~~powershell
+uv run --project plugins/bilibili-understand --locked python plugins/bilibili-understand/skills/bilibili-understand/scripts/doctor.py
+~~~
+
+`doctor.py` 会检查 Python、yt-dlp、faster-whisper、ctranslate2、可选的 ffmpeg/ffprobe
+以及可见 CUDA 设备；它不会下载视频、模型或访问 Bilibili。ffmpeg 当前不是基本 m4a
+路径的硬性依赖，但复杂格式或后续媒体处理可能需要它。
 
 首次转写默认使用 small。已有转录时，不传 ASR 参数会继承原配置，避免把
 large-v3-turbo 缓存意外降级或重跑。缓存匹配会比较音频身份、模型、语言、VAD、hotwords、
@@ -240,8 +262,9 @@ Agent 框架。
 ## 开发与验证
 
 ~~~powershell
-python -m unittest discover -s tests -v
-python -m py_compile plugins/bilibili-understand/skills/bilibili-understand/scripts/probe_bilibili.py plugins/bilibili-understand/skills/bilibili-understand/scripts/transcribe_audio.py plugins/bilibili-understand/skills/bilibili-understand/scripts/pipeline.py
+uv sync --project plugins/bilibili-understand --locked
+uv run --project plugins/bilibili-understand --locked python -m unittest discover -s tests -v
+uv run --project plugins/bilibili-understand --locked python -m py_compile plugins/bilibili-understand/skills/bilibili-understand/scripts/probe_bilibili.py plugins/bilibili-understand/skills/bilibili-understand/scripts/transcribe_audio.py plugins/bilibili-understand/skills/bilibili-understand/scripts/pipeline.py plugins/bilibili-understand/skills/bilibili-understand/scripts/doctor.py
 ~~~
 
 CI 只运行无网络、无视频下载的确定性检查，避免给 Bilibili 制造自动化流量。

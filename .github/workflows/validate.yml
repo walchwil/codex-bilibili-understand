@@ -15,10 +15,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - name: Run deterministic checks
         run: |
-          python -m unittest discover -s tests -v
-          python -m py_compile \
+          uv sync --project plugins/bilibili-understand --locked
+          uv run --project plugins/bilibili-understand --locked python -m unittest discover -s tests -v
+          uv run --project plugins/bilibili-understand --locked python -m py_compile \
             plugins/bilibili-understand/skills/bilibili-understand/scripts/probe_bilibili.py \
             plugins/bilibili-understand/skills/bilibili-understand/scripts/transcribe_audio.py \
-            plugins/bilibili-understand/skills/bilibili-understand/scripts/pipeline.py
+            plugins/bilibili-understand/skills/bilibili-understand/scripts/pipeline.py \
+            plugins/bilibili-understand/skills/bilibili-understand/scripts/doctor.py

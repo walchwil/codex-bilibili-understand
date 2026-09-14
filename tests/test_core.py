@@ -83,7 +83,13 @@ class PackageTests(unittest.TestCase):
         for manifest in (plugin / "plugin.json", plugin / ".codex-plugin" / "plugin.json"):
             data = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(data["name"], "bilibili-understand")
-            self.assertEqual(data["version"], "0.4.0")
+            self.assertEqual(data["version"], "0.5.0")
+
+        self.assertTrue((plugin / "pyproject.toml").is_file())
+        self.assertTrue((plugin / "uv.lock").is_file())
+        self.assertTrue((plugin / "setup.ps1").is_file())
+        self.assertTrue((plugin / "setup.sh").is_file())
+        self.assertTrue((SKILL / "scripts" / "doctor.py").is_file())
 
         marketplace = json.loads(
             (ROOT / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8")
@@ -94,6 +100,8 @@ class PackageTests(unittest.TestCase):
 
         skill_text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
         self.assertTrue(skill_text.startswith("---\nname: bilibili-understand\n"))
+        self.assertIn("uv run --project", skill_text)
+        self.assertIn("do not use bare `python`", skill_text)
         openai_yaml = (SKILL / "agents" / "openai.yaml").read_text(encoding="utf-8")
         self.assertIn("$bilibili-understand", openai_yaml)
 
